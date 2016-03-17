@@ -1,266 +1,158 @@
-""" Classes and functions for fitting tensors for CHARMED """
-from __future__ import division, print_function, absolute_import
-
-import warnings
-
 import numpy as np
+from scipy.optimize import curve_fit, leastsq
+from dipy.reconst import dti
+import numpy as np
+import dipy.data as dpd
+import dipy.core.gradients as dpg	
+from dipy.segment.mask import median_otsu
+import nibabel as nib
+from dipy.core.gradients import GradientTable
 
-import scipy.optimize as opt
-from .base import ReconstModel
 
-from dipy.reconst.dti import (TensorFit, design_matrix, _min_positive_signal,
-                              decompose_tensor, from_lower_triangular,
-                              lower_triangular, apparent_diffusion_coef)
-from dipy.reconst.dki import _positive_evals
+fdata, fbvals, fbvecs = dpd.get_data('small_101D')
+img = nib.load(fdata)
+data = img.get_data()
+big_delta=150
+small_delta=40
+gtab = dpg.gradient_table(fbvals, fbvecs, big_delta=150,
+					  small_delta=40, b0_threshold=1000)
+a = GradientTable(gtab.gradients, big_delta=150,
+				  small_delta=40, b0_threshold=1000)
+a.bvals = gtab.bvals[gtab.b0s_mask]
+a.bvecs = gtab.bvecs[gtab.b0s_mask]
+a.gradients = gtab.gradients[gtab.b0s_mask]
+a.b0s_mask = gtab.b0s_mask[gtab.b0s_mask]
+	
+maskdata, mask = median_otsu(data, 3, 1, True,
+                             vol_idx=range(10, 50), dilate=2)
+print('maskdata.shape (%d, %d, %d, %d)' % maskdata.shape)
 
-from dipy.core.sphere import Sphere
-from .vec_val_sum import vec_val_vect
-from dipy.core.ndindex import ndindex
 
-def charmed_prediction(params, gtab, S0 ):
-    """
-    Predict a signal given tensor parameters.
+def intial_conditions_prediction(a, maskdata):
+
+	tenmodel = dti.TensorModel(a)
+	tenfit = tenmodel.fit(maskdata[:,:,:,gtab.b0s_mask])
+
+	intial_params  = {}	# intialising a dictionary
+						# for storing intial parameters
+
+	intial_params['lambda_per'] = (dti.axial_diffusivity(tenfit.evals))
+							# lambda_per axial diffusivity
+	print(intial_params['lambda_per'].shape)  
+	print('p')
+	intial_params['lambda_par'] = (dti.radial_diffusivity(tenfit.evals))
+							#  lambda_par is radial 
+							#  diffusivity
+
+	return intial_params
+
+def create_qtable(a, origin=np.array([0])):
+    """ create a normalized version of gradients
 
     Parameters
     ----------
-    params : ndarray
-        Tensor parameters. The last dimension should have 12 tensor
-        parameters: 3 eigenvalues, followed by the 3 corresponding
-        eigenvectors.
+    gtab : GradientTable
+    origin : (3,) ndarray
+        center of qspace
 
-    gtab : a GradientTable class instance
-        The gradient table for this prediction
-
-
-    Notes
-    -----
-    The Predicted signal is given by
-
-        E(Q,Delta) = f_H * E_H(Q,Delta) + f_R * E_R(Q,Delta)
-
-        where E_H and E_R are signals arising from hindered and restricted
-        components.
-
-        Qper2_H = gtab.qvals**2*(1-(sin(Q(:,1))*sin(theta_H)*cos(Q(:,2)-phi_H)+cos(Q(:,1))*cos(theta_H))**2)
-
-        Qpar2_H = gtab.qvals**2*(sin(Q(:,1))*sin(theta_H)*cos(Q(:,2)-phi_H)+cos(Q(:,1))*cos(theta_H))**2;
-
-        Qper2_R = gtab.qvals**2*(1-(sin(Q(:,1))*sin(theta_R)*cos(Q(:,2)-phi_R)+cos(Q(:,1))*cos(theta_R))**2);
-
-        Qpar2_R = gtab.qvals**2*(sin(Q(:,1))*sin(theta_R)*cos(Q(:,2)-phi_R)+cos(Q(:,1))*cos(theta_R))**2;
-
-
-        E_H = e^(-4 * pi^2 * (Delta - (delta/3)) * (Qper2_H *lambda_per + Qpar2_H * lambda_par))
-        E_R = e^(-4 * pi^2 * (Qpar2_R * (Delta - (delta/3)) * Dif_par - ((R^4 * Qper2_R)/Dif_per * Tau)*(2-(99/112)*(R^2/Dif_per* Tau)))
-
-        E = f_R * E_R + f_H * E_H
-
-        Initially data is fitted by DTI to know eigenvalues and eigenvectors of
-        Diffusion tensor. The estimated parameters are used to fit the CHARMED
-        signal.
-
-        """
-        evals = params[..., :3]
-        evecs = params[..., 3:-2].reshape(params.shape[:-1] + (3, 3))
-        f = params[..., 12]
-        S0 = params[..., 13]
-        qform = vec_val_vect(evecs, evals)
-        sphere = Sphere(xyz=gtab.bvecs[~gtab.b0s_mask])
-        adc = apparent_diffusion_coef(qform, sphere)
-        mask = _positive_evals(evals[..., 0], evals[..., 1], evals[..., 2])
-
-        # First do the calculation for the diffusion weighted measurements:
-        pred_sig = np.zeros(f.shape + (gtab.bvals.shape[0],))
-        index = ndindex(f.shape)
-        for v in index:
-            if mask[v]:
-                E_H = f[v] * np.exp(-4 * np.pi**2 * (Delta - (delta/3)) * (Qper2_H * lambda_per + Qpar2_H * lambda_par))
-                E_R = (1-f[v]) * np.exp(-4 * np.pi**2 * (Qpar2_R * (Delta - (delta/3)) * Dif_par - ((R^4 * Qper2_R)/Dif_per * Tau) * (2 - (99/112) * (R**2/(Dif_per * Tau)))))
-                pre_pred_sig = S0[v] * (E_H + E_R)
-
-                # Then we need to sort out what goes where:
-                pred_s = np.zeros(pre_pred_sig.shape[:-1] + (gtab.bvals.shape[0],))
-
-                # These are the diffusion-weighted values
-                pred_s[..., ~gtab.b0s_mask] = pre_pred_sig
-
-                # For completeness, we predict the mean S0 for the non-diffusion
-                # weighted measurements, which is our best guess:
-                pred_s[..., gtab.b0s_mask] = S0[v]
-                pred_sig[v] = pred_s
-
-        return pred_sig
-
-
-class CharmedTensorModel(ReconstModel):
-    """ Diffusion Tensor
+    Returns
+    -------
+    qtable : ndarray
     """
-    def __init__(self, gtab, fit_method="WLS", *args, **kwargs):
-        """ A Diffusion Tensor Model [1]_, [2]_.
 
-        Parameters
-        ----------
-        gtab : GradientTable class instance
+    bv = a.bvals
+    bsorted = np.sort(bv[np.bitwise_not(~a.b0s_mask)])
+    for i in range(len(bsorted)):
+        bmin = bsorted[i]
+        try:
+            if np.sqrt(bv.max() / bmin) > origin + 1:
+                continue
+            else:
+                break
+        except ZeroDivisionError:
+            continue
 
-        fit_method : str or callable
-            str can be one of the following:
-            'WLS' for weighted least squares
-                dti.wls_fit_tensor
-            'LS' or 'OLS' for ordinary least squares
-                dti.ols_fit_tensor
-            'NLLS' for non-linear least-squares
-                dti.nlls_fit_tensor
-            'RT' or 'restore' or 'RESTORE' for RESTORE robust tensor
-                fitting [3]_
-                dti.restore_fit_tensor
+    bv = np.sqrt(bv / bmin)
+    qtable = np.vstack((bv, bv, bv)).T * a.bvecs
+    return qtable
 
-            callable has to have the signature:
-              fit_method(design_matrix, data, *args, **kwargs)
+def hindered_signal(gtab, angles):
 
-        args, kwargs : arguments and key-word arguments passed to the
-           fit_method. See dti.wls_fit_tensor, dti.ols_fit_tensor for details
+	theta_Q = np.arctan(qvec_H[1]/qvec_H[0])
+	phi_Q = np.sqrt(qvec_H[1]**2 + qvec_H[0]**2)
+	phi_Q = np.arctan(phi_Q/qvec_H[2])
 
-        min_signal : float
-            The minimum signal value. Needs to be a strictly positive
-            number. Default: minimal signal in the data provided to `fit`.
+	intial_params = intial_conditions_prediction(a,maskdata)
 
-        References
-        ----------
-        To be done
-        """
-        ReconstModel.__init__(self, gtab)
+	Qper2_H = (a.qvals**2)*(1-(np.sin(theta_Q)*np.sin(angles[1])*np.cos(phi_Q - angles[0])+np.cos(theta_Q)*np.cos(angles[1]))**2)
+	Qpar2_H = (a.qvals**2)*((np.sin(theta_Q))*np.sin(angles[1])*np.cos(phi_Q - angles[0])+np.cos(theta_Q)*np.cos(angles[1]))**2
+	E_H = np.exp(-4 * np.pi**2 * (big_delta - (small_delta/3)) * (Qper2_H * intial_params['lambda_per'] + 
+    			 										Qpar2_H * intial_params['lambda_par']))
+	return E_H
 
-        if not callable(fit_method):
-            try:
-                fit_method = common_fit_methods[fit_method]
-            except KeyError:
-                e_s = '"' + str(fit_method) + '" is not a known fit '
-                e_s += 'method, the fit method should either be a '
-                e_s += 'function or one of the common fit methods'
-                raise ValueError(e_s)
-        self.fit_method = fit_method
-        self.design_matrix = design_matrix(self.gtab)
-        self.args = args
-        self.kwargs = kwargs
-        self.min_signal = self.kwargs.pop('min_signal', None)
-        if self.min_signal is not None and self.min_signal <= 0:
-            e_s = "The `min_signal` key-word argument needs to be strictly"
-            e_s += " positive."
-            raise ValueError(e_s)
+def hingered_residual(angles, data, gtab):
+	return data - hindered_signal(gtab,angles)
 
-    def fit(self, data, mask=None):
-        """ Fit method of the DTI model class
+def hindered_fit(maskdata, gtab):
+	qvec_H = create_qtable(a)
+	k = qvec_H
+	print(qvec_H[1])
 
-        Parameters
-        ----------
-        data : array
-            The measured signal from one voxel.
+	ydata = maskdata[:,:,:, gtab.b0s_mask]
+	print(ydata.ravel().shape)
+	while (qvec_H[:,1].shape != ydata.ravel().shape):
+		qvec_H = np.concatenate((qvec_H,k), axis=0)
+		a.qvals = np.concatenate((a.qvals, gtab.qvals[gtab.b0s_mask]), axis=0)
+	xdata = np.transpose(qvec_H)
+	print(xdata.shape)
+	print(ydata.ravel().shape)
+	param,pov = curve_fit(hindered_signal, xdata, ydata.ravel())
+	return param
 
-        mask : array
-            A boolean array used to mark the coordinates in the data that
-            should be analyzed that has the shape data.shape[:-1]
+def hindered_and_restricted_signal(gtab, params):
 
-        """
-        if mask is None:
-            # Flatten it to 2D either way:
-            data_in_mask = np.reshape(data, (-1, data.shape[-1]))
-        else:
-            # Check for valid shape of the mask
-            if mask.shape != data.shape[:-1]:
-                raise ValueError("Mask is not the same shape as data.")
-            mask = np.array(mask, dtype=bool, copy=False)
-            data_in_mask = np.reshape(data[mask], (-1, data.shape[-1]))
 
-        if self.min_signal is None:
-            min_signal = _min_positive_signal(data)
-        else:
-            min_signal = self.min_signal
+	theta_Q = np.arctan(qvec[1]/qvec[0])
+	phi_Q = np.sqrt(qvec[1]**2 + qvec[0]**2)
+	phi_Q = np.arctan(phi_Q/qvec[2])
 
-        data_in_mask = np.maximum(data_in_mask, min_signal)
-        params_in_mask = self.fit_method(self.design_matrix, data_in_mask,
-                                         *self.args, **self.kwargs)
+	Qper2_H = (a.qvals**2)*(1-(np.sin(theta_Q)*np.sin(params[1])*np.cos(phi_Q - params[0])+np.cos(theta_Q)*np.cos(params[1]))**2)
+	Qpar2_H = (a.qvals**2)*((np.sin(theta_Q))*np.sin(params[1])*np.cos(phi_Q - params[0])+np.cos(theta_Q)*np.cos(params[1]))**2
 
-        if mask is None:
-            out_shape = data.shape[:-1] + (-1, )
-            params = params_in_mask.reshape(out_shape)
-        else:
-            params = np.zeros(data.shape[:-1] + (12,))
-            params[mask, :] = params_in_mask
+	Qper2_R = (a.qvals**2)*(1-(np.sin(theta_Q)*np.sin(params[2])*np.cos(phi_Q - params[3])+np.cos(theta_Q)*np.cos(parmas[2]))**2)
+	Qpar2_R = (a.qvals**2)*((np.sin(theta_Q))*np.sin(params[2])*np.cos(phi_Q - params[3])+np.cos(theta_Q)*np.cos(params[2]))**2
 
-        return CharmedTensorFit(self, params)
+	E_H = np.exp(-4 * np.pi**2 * (big_delta - (small_delta/3)) * (Qper2_R * params[4] + 
+    			 										Qpar2_R * params[5]))
+	E_R = (1-f[v]) * np.exp(-4 * np.pi**2 * (Qpar2_R * (big_delta - (small_delta/3)) * params[6] - ((R^4 * Qper2_R)/Dif_per * Tau) * (2 - (99/112) * (R**2/(Dif_per * Tau)))))
 
-    def predict(self, params, S0=1):
-        """
-        Predict a signal for this TensorModel class instance given parameters.
+	return E_R + E_H
 
-        Parameters
-        ----------
-        params : ndarray
-            The last dimension should have 12 tensor parameters: 3
-            eigenvalues, followed by the 3 eigenvectors
 
-        S0 : float or ndarray
-            The non diffusion-weighted signal in every voxel, or across all
-            voxels. Default: 1
-        """
-        return charmed_prediction(params, self.gtab, S0)
+def hind_and_rest_residual(params, data, gtab):
+	return data - hindered_and_restricted_signal(gtab, params)
 
-class CharmedTensorFit(TensorFit):
-    """ Class for fitting the CHARMED Model """
-    def __init__(self, model, model_params):
-        """ Initialize a CharmedTensorFit class instance.
-        Since the charmed model is an extension of DTI, class
-        instance is defined as subclass of the TensorFit from dti.py
+def hind_and_rest_fit(maskdata, gtab, x0):
+	charmed_params, flag = leastsq(hind_and_rest_residual, x0, args=(maskdata, gtab))
+	return charmed_params
 
-        Parameters
-        ----------
-        model : CharmedTensorModel Class instance
-            Class instance containing the charmed model for the fit
-        model_params : ndarray (x, y, z, 14) or (n, 14)
-            All parameters estimated from the charmed model.
-            Parameters are ordered as follows:
-                1) Three diffusion tensor's eigenvalues of hindered and
-                   restricted parts
-                2) Three lines of the eigenvector matrix each containing the
-                   first, second and third coordinates of the eigenvector
-                3) The volume fractions of the hindered and restricted
-                   compartments
-                4) Parallel Diffusivity in restricted compartments
-                5) Orientations of restricted part in spherical co-ordinates
-                """
-        TensorFit.__init__(self, model, model_params)
+def noise_function(E_est, noise):
+	E = np.sqrt(E_est**2 + noise**2)
+	return E
 
-    @property
-    def f(self):
-        """ Returns the free water diffusion volume fraction f """
-        return self.model_params[..., 12]
+def noise_residual(noise, data, E_est):
+	return data - noise_function(E_est,noise)
 
-    @property
-    def S0(self):
-        """ Returns the non-diffusion weighted signal estimate """
-        return self.model_params[..., 13]
+def noise_fit(data, E_est, n0):
+	noise_param , flag = leastsq(noise_residual, n0, args=(data,E_est))
+	return noise_param
 
-    def predict(self, gtab, step=None):
-        r""" Given a charmed model fit, predict the signal on the
-        vertices of a gradient table
 
-        Parameters
-        ----------
-        gtab : a GradientTable class instance
-            The gradient table for this prediction
 
-        step : int, optional
-            Number of voxels to be processed simultaneously
-        """
-        shape = self.model_params.shape[:-1]
-        size = np.prod(shape)
-        if step is None:
-            step = self.model.kwargs.get('step', size)
-        if step >= size:
-            return fwdti_prediction(self.model_params, gtab)
-        params = np.reshape(self.model_params,
-                            (-1, self.model_params.shape[-1]))
-        predict = np.empty((size, gtab.bvals.shape[0]))
-        for i in range(0, size, step):
-            predict[i:i+step] = fwdti_prediction(params[i:i+step], gtab)
-        return predict.reshape(shape + (gtab.bvals.shape[0], ))
+intial_params = intial_conditions_prediction(a, maskdata)
+"""
+print(intial_params['lambda_per'])
+print(maskdata[:,:,:,gtab.b0s_mask].ravel().shape)
+hind_param = hindered_fit(maskdata,gtab)
+print(hind_param)
+"""
